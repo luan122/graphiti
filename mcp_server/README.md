@@ -104,6 +104,46 @@ The server uses the following environment variables:
 
 You can set these variables in a `.env` file in the project directory.
 
+## LLM Provider Configuration
+
+The Graphiti MCP server supports multiple LLM providers. By default, it uses **Google Gemini**, but you can also configure it to use OpenAI or Azure OpenAI.
+
+### Google Gemini (Default)
+
+To use Google Gemini:
+
+1. Set your Google API key:
+   ```bash
+   export GOOGLE_API_KEY=your_google_api_key_here
+   ```
+
+2. Optionally configure Gemini models (defaults are shown):
+   ```bash
+   export MODEL_NAME=gemini-2.0-flash
+   export SMALL_MODEL_NAME=gemini-2.5-flash-lite-preview-06-17
+   export EMBEDDER_MODEL_NAME=embedding-001
+   ```
+
+### OpenAI
+
+To use OpenAI instead of Gemini:
+
+1. Set your OpenAI API key:
+   ```bash
+   export OPENAI_API_KEY=your_openai_api_key_here
+   ```
+
+2. Optionally configure OpenAI models:
+   ```bash
+   export MODEL_NAME=gpt-4o-mini
+   export SMALL_MODEL_NAME=gpt-4o-mini
+   export EMBEDDER_MODEL_NAME=text-embedding-3-small
+   ```
+
+### Azure OpenAI
+
+To use Azure OpenAI, configure the Azure-specific environment variables as listed in the [Environment Variables](#environment-variables) section.
+
 ## Running the Server
 
 To run the Graphiti MCP server directly using `uv`:

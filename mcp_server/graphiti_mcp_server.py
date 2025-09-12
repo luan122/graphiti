@@ -12,7 +12,11 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, TypedDict, cast
 
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+try:
+    from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+except ImportError:
+    DefaultAzureCredential = None
+    get_bearer_token_provider = None
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from openai import AsyncAzureOpenAI
@@ -20,13 +24,24 @@ from pydantic import BaseModel, Field
 
 from graphiti_core import Graphiti
 from graphiti_core.edges import EntityEdge
-from graphiti_core.embedder.azure_openai import AzureOpenAIEmbedderClient
+try:
+    from graphiti_core.embedder.azure_openai import AzureOpenAIEmbedderClient
+except ImportError:
+    AzureOpenAIEmbedderClient = None
 from graphiti_core.embedder.client import EmbedderClient
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
+from graphiti_core.embedder.vscode_embedder import VSCodeEmbedder, VSCodeEmbedderConfig
 from graphiti_core.llm_client import LLMClient
-from graphiti_core.llm_client.azure_openai_client import AzureOpenAILLMClient
+try:
+    from graphiti_core.llm_client.azure_openai_client import AzureOpenAIClient as AzureOpenAILLMClient
+except ImportError:
+    AzureOpenAILLMClient = None
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.llm_client.openai_client import OpenAIClient
+from graphiti_core.llm_client.gemini_client import GeminiClient
+from graphiti_core.llm_client.vscode_client import VSCodeClient
+from graphiti_core.cross_encoder.gemini_reranker_client import GeminiRerankerClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 from graphiti_core.search.search_config_recipes import (
     NODE_HYBRID_SEARCH_NODE_DISTANCE,
@@ -38,9 +53,9 @@ from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 load_dotenv()
 
 
-DEFAULT_LLM_MODEL = 'gpt-4.1-mini'
-SMALL_LLM_MODEL = 'gpt-4.1-nano'
-DEFAULT_EMBEDDER_MODEL = 'text-embedding-3-small'
+DEFAULT_LLM_MODEL = 'gemini-2.0-flash'
+SMALL_LLM_MODEL = 'gemini-2.5-flash-lite-preview-06-17'
+DEFAULT_EMBEDDER_MODEL = 'embedding-001'
 
 # Semaphore limit for concurrent Graphiti operations.
 # Decrease this if you're experiencing 429 rate limit errors from your LLM provider.
@@ -121,7 +136,7 @@ class Procedure(BaseModel):
     )
 
 
-ENTITY_TYPES: dict[str, BaseModel] = {
+ENTITY_TYPES: dict[str, type[BaseModel]] = {
     'Requirement': Requirement,  # type: ignore
     'Preference': Preference,  # type: ignore
     'Procedure': Procedure,  # type: ignore
@@ -168,6 +183,9 @@ class StatusResponse(TypedDict):
 
 
 def create_azure_credential_token_provider() -> Callable[[], str]:
+    if DefaultAzureCredential is None or get_bearer_token_provider is None:
+        raise ImportError("Azure identity dependencies not available. Install azure-identity package.")
+    
     credential = DefaultAzureCredential()
     token_provider = get_bearer_token_provider(
         credential, 'https://cognitiveservices.azure.com/.default'
@@ -196,6 +214,7 @@ class GraphitiLLMConfig(BaseModel):
     model: str = DEFAULT_LLM_MODEL
     small_model: str = SMALL_LLM_MODEL
     temperature: float = 0.0
+    provider: str = 'gemini'  # 'openai', 'azure', 'gemini', or 'vscode'
     azure_openai_endpoint: str | None = None
     azure_openai_deployment_name: str | None = None
     azure_openai_api_version: str | None = None
@@ -212,14 +231,55 @@ class GraphitiLLMConfig(BaseModel):
         small_model_env = os.environ.get('SMALL_MODEL_NAME', '')
         small_model = small_model_env if small_model_env.strip() else SMALL_LLM_MODEL
 
+        # Determine provider based on environment variables
+        provider = 'gemini'  # Default to Gemini
+        
         azure_openai_endpoint = os.environ.get('AZURE_OPENAI_ENDPOINT', None)
+        google_api_key = os.environ.get('GOOGLE_API_KEY', None)
+        openai_api_key = os.environ.get('OPENAI_API_KEY', None)
+        use_vscode = os.environ.get('USE_VSCODE_MODELS', 'false').lower() == 'true'
+        
+        if use_vscode:
+            provider = 'vscode'
+        elif azure_openai_endpoint is not None:
+            provider = 'azure'
+        elif openai_api_key and not google_api_key:
+            provider = 'openai'
+        elif google_api_key:
+            provider = 'gemini'
+
         azure_openai_api_version = os.environ.get('AZURE_OPENAI_API_VERSION', None)
         azure_openai_deployment_name = os.environ.get('AZURE_OPENAI_DEPLOYMENT_NAME', None)
         azure_openai_use_managed_identity = (
             os.environ.get('AZURE_OPENAI_USE_MANAGED_IDENTITY', 'false').lower() == 'true'
         )
 
-        if azure_openai_endpoint is None:
+        if provider == 'azure':
+            # Setup for Azure OpenAI API
+            # Log if empty deployment name was provided
+            if azure_openai_deployment_name is None:
+                logger.error('AZURE_OPENAI_DEPLOYMENT_NAME environment variable not set')
+                raise ValueError('AZURE_OPENAI_DEPLOYMENT_NAME environment variable not set')
+                
+            if not azure_openai_use_managed_identity:
+                # api key
+                api_key = os.environ.get('OPENAI_API_KEY', None)
+            else:
+                # Managed identity
+                api_key = None
+
+            return cls(
+                provider=provider,
+                azure_openai_use_managed_identity=azure_openai_use_managed_identity,
+                azure_openai_endpoint=azure_openai_endpoint,
+                api_key=api_key,
+                azure_openai_api_version=azure_openai_api_version,
+                azure_openai_deployment_name=azure_openai_deployment_name,
+                model=model,
+                small_model=small_model,
+                temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
+            )
+        elif provider == 'openai':
             # Setup for OpenAI API
             # Log if empty model was provided
             if model_env == '':
@@ -232,31 +292,27 @@ class GraphitiLLMConfig(BaseModel):
                 )
 
             return cls(
-                api_key=os.environ.get('OPENAI_API_KEY'),
+                provider=provider,
+                api_key=openai_api_key,
                 model=model,
                 small_model=small_model,
                 temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
             )
         else:
-            # Setup for Azure OpenAI API
-            # Log if empty deployment name was provided
-            if azure_openai_deployment_name is None:
-                logger.error('AZURE_OPENAI_DEPLOYMENT_NAME environment variable not set')
-
-                raise ValueError('AZURE_OPENAI_DEPLOYMENT_NAME environment variable not set')
-            if not azure_openai_use_managed_identity:
-                # api key
-                api_key = os.environ.get('OPENAI_API_KEY', None)
-            else:
-                # Managed identity
-                api_key = None
+            # Setup for Gemini API (default)
+            # Log if empty model was provided
+            if model_env == '':
+                logger.debug(
+                    f'MODEL_NAME environment variable not set, using default Gemini model: {DEFAULT_LLM_MODEL}'
+                )
+            elif not model_env.strip():
+                logger.warning(
+                    f'Empty MODEL_NAME environment variable, using default Gemini model: {DEFAULT_LLM_MODEL}'
+                )
 
             return cls(
-                azure_openai_use_managed_identity=azure_openai_use_managed_identity,
-                azure_openai_endpoint=azure_openai_endpoint,
-                api_key=api_key,
-                azure_openai_api_version=azure_openai_api_version,
-                azure_openai_deployment_name=azure_openai_deployment_name,
+                provider=provider,
+                api_key=google_api_key,
                 model=model,
                 small_model=small_model,
                 temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
@@ -295,8 +351,14 @@ class GraphitiLLMConfig(BaseModel):
             LLMClient instance
         """
 
-        if self.azure_openai_endpoint is not None:
+        if self.provider == 'azure':
             # Azure OpenAI API setup
+            if not self.azure_openai_endpoint:
+                raise ValueError('AZURE_OPENAI_ENDPOINT must be set when using Azure OpenAI API')
+                
+            if AzureOpenAILLMClient is None:
+                raise ImportError("Azure OpenAI client not available. Install required dependencies.")
+                
             if self.azure_openai_use_managed_identity:
                 # Use managed identity for authentication
                 token_provider = create_azure_credential_token_provider()
@@ -332,18 +394,41 @@ class GraphitiLLMConfig(BaseModel):
                 )
             else:
                 raise ValueError('OPENAI_API_KEY must be set when using Azure OpenAI API')
+        elif self.provider == 'openai':
+            # OpenAI API setup
+            if not self.api_key:
+                raise ValueError('OPENAI_API_KEY must be set when using OpenAI API')
 
-        if not self.api_key:
-            raise ValueError('OPENAI_API_KEY must be set when using OpenAI API')
+            llm_client_config = LLMConfig(
+                api_key=self.api_key, model=self.model, small_model=self.small_model
+            )
+            llm_client_config.temperature = self.temperature
+            return OpenAIClient(config=llm_client_config)
+        elif self.provider == 'gemini':
+            # Google Gemini API setup
+            if not self.api_key:
+                raise ValueError('GOOGLE_API_KEY must be set when using Gemini API')
 
-        llm_client_config = LLMConfig(
-            api_key=self.api_key, model=self.model, small_model=self.small_model
-        )
-
-        # Set temperature
-        llm_client_config.temperature = self.temperature
-
-        return OpenAIClient(config=llm_client_config)
+            return GeminiClient(
+                config=LLMConfig(
+                    api_key=self.api_key,
+                    model=self.model,
+                    small_model=self.small_model,
+                    temperature=self.temperature,
+                )
+            )
+        elif self.provider == 'vscode':
+            # VS Code models setup
+            return VSCodeClient(
+                config=LLMConfig(
+                    api_key="vscode",  # Placeholder, not used for VS Code
+                    model=self.model,
+                    small_model=self.small_model,
+                    temperature=self.temperature,
+                )
+            )
+        else:
+            raise ValueError(f'Unknown provider: {self.provider}. Supported providers: openai, azure, gemini, vscode')
 
 
 class GraphitiEmbedderConfig(BaseModel):
@@ -354,6 +439,7 @@ class GraphitiEmbedderConfig(BaseModel):
 
     model: str = DEFAULT_EMBEDDER_MODEL
     api_key: str | None = None
+    provider: str = 'gemini'  # 'openai', 'azure', 'gemini', or 'vscode'
     azure_openai_endpoint: str | None = None
     azure_openai_deployment_name: str | None = None
     azure_openai_api_version: str | None = None
@@ -367,7 +453,23 @@ class GraphitiEmbedderConfig(BaseModel):
         model_env = os.environ.get('EMBEDDER_MODEL_NAME', '')
         model = model_env if model_env.strip() else DEFAULT_EMBEDDER_MODEL
 
+        # Determine provider based on environment variables
+        provider = 'gemini'  # Default to Gemini
+        
         azure_openai_endpoint = os.environ.get('AZURE_OPENAI_EMBEDDING_ENDPOINT', None)
+        google_api_key = os.environ.get('GOOGLE_API_KEY', None)
+        openai_api_key = os.environ.get('OPENAI_API_KEY', None)
+        use_vscode = os.environ.get('USE_VSCODE_MODELS', 'false').lower() == 'true'
+        
+        if use_vscode:
+            provider = 'vscode'
+        elif azure_openai_endpoint is not None:
+            provider = 'azure'
+        elif openai_api_key and not google_api_key:
+            provider = 'openai'
+        elif google_api_key:
+            provider = 'gemini'
+
         azure_openai_api_version = os.environ.get('AZURE_OPENAI_EMBEDDING_API_VERSION', None)
         azure_openai_deployment_name = os.environ.get(
             'AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME', None
@@ -375,7 +477,8 @@ class GraphitiEmbedderConfig(BaseModel):
         azure_openai_use_managed_identity = (
             os.environ.get('AZURE_OPENAI_USE_MANAGED_IDENTITY', 'false').lower() == 'true'
         )
-        if azure_openai_endpoint is not None:
+
+        if provider == 'azure':
             # Setup for Azure OpenAI API
             # Log if empty deployment name was provided
             azure_openai_deployment_name = os.environ.get(
@@ -383,7 +486,6 @@ class GraphitiEmbedderConfig(BaseModel):
             )
             if azure_openai_deployment_name is None:
                 logger.error('AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME environment variable not set')
-
                 raise ValueError(
                     'AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME environment variable not set'
                 )
@@ -398,21 +500,39 @@ class GraphitiEmbedderConfig(BaseModel):
                 api_key = None
 
             return cls(
+                provider=provider,
                 azure_openai_use_managed_identity=azure_openai_use_managed_identity,
                 azure_openai_endpoint=azure_openai_endpoint,
                 api_key=api_key,
                 azure_openai_api_version=azure_openai_api_version,
                 azure_openai_deployment_name=azure_openai_deployment_name,
+                model=model,
+            )
+        elif provider == 'openai':
+            # Setup for OpenAI API
+            return cls(
+                provider=provider,
+                model=model,
+                api_key=openai_api_key,
             )
         else:
+            # Setup for Gemini API (default)
             return cls(
+                provider=provider,
                 model=model,
-                api_key=os.environ.get('OPENAI_API_KEY'),
+                api_key=google_api_key,
             )
 
     def create_client(self) -> EmbedderClient | None:
-        if self.azure_openai_endpoint is not None:
+        if self.provider == 'azure':
             # Azure OpenAI API setup
+            if AzureOpenAIEmbedderClient is None:
+                raise ImportError("Azure OpenAI embedder not available. Install required dependencies.")
+                
+            if not self.azure_openai_endpoint:
+                logger.error('AZURE_OPENAI_ENDPOINT must be set when using Azure OpenAI API')
+                return None
+                
             if self.azure_openai_use_managed_identity:
                 # Use managed identity for authentication
                 token_provider = create_azure_credential_token_provider()
@@ -439,14 +559,34 @@ class GraphitiEmbedderConfig(BaseModel):
             else:
                 logger.error('OPENAI_API_KEY must be set when using Azure OpenAI API')
                 return None
-        else:
+        elif self.provider == 'openai':
             # OpenAI API setup
             if not self.api_key:
                 return None
 
             embedder_config = OpenAIEmbedderConfig(api_key=self.api_key, embedding_model=self.model)
-
             return OpenAIEmbedder(config=embedder_config)
+        elif self.provider == 'gemini':
+            # Gemini API setup
+            if not self.api_key:
+                return None
+
+            embedder_config = GeminiEmbedderConfig(
+                api_key=self.api_key,
+                embedding_model=self.model
+            )
+            return GeminiEmbedder(config=embedder_config)
+        elif self.provider == 'vscode':
+            # VS Code embedder with intelligent fallback
+            embedder_config = VSCodeEmbedderConfig(
+                embedding_model='vscode-embedder',
+                embedding_dim=1024,
+                use_fallback=True  # Enable fallback when VS Code not available
+            )
+            return VSCodeEmbedder(config=embedder_config)
+        else:
+            logger.error(f'Unknown provider: {self.provider}. Supported providers: openai, azure, gemini, vscode')
+            return None
 
 
 class Neo4jConfig(BaseModel):
@@ -589,6 +729,19 @@ async def initialize_graphiti():
 
         embedder_client = config.embedder.create_client()
 
+        # Create cross-encoder/reranker client
+        cross_encoder_client = None
+        if llm_client and config.llm.provider == 'gemini':
+            cross_encoder_client = GeminiRerankerClient(
+                config=LLMConfig(
+                    api_key=config.llm.api_key,
+                    model=config.llm.small_model  # Use small model for reranking
+                )
+            )
+        elif llm_client and config.llm.provider == 'vscode':
+            # VS Code models can be used for reranking too
+            cross_encoder_client = None  # Could implement VSCode reranker if needed
+
         # Initialize Graphiti client
         graphiti_client = Graphiti(
             uri=config.neo4j.uri,
@@ -596,6 +749,7 @@ async def initialize_graphiti():
             password=config.neo4j.password,
             llm_client=llm_client,
             embedder=embedder_client,
+            cross_encoder=cross_encoder_client,
             max_coroutines=SEMAPHORE_LIMIT,
         )
 
@@ -610,10 +764,17 @@ async def initialize_graphiti():
 
         # Log configuration details for transparency
         if llm_client:
-            logger.info(f'Using OpenAI model: {config.llm.model}')
+            logger.info(f'Using {config.llm.provider} LLM - Model: {config.llm.model}')
             logger.info(f'Using temperature: {config.llm.temperature}')
+            if cross_encoder_client:
+                logger.info(f'Using {config.llm.provider} cross-encoder for reranking')
         else:
             logger.info('No LLM client configured - entity extraction will be limited')
+
+        if embedder_client:
+            logger.info(f'Using {config.embedder.provider} embedder - Model: {config.embedder.model}')
+        else:
+            logger.info('No embedder client configured')
 
         logger.info(f'Using group_id: {config.group_id}')
         logger.info(

@@ -7,6 +7,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv using the installer script
@@ -20,24 +21,46 @@ ENV PATH="/root/.local/bin:${PATH}"
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
+    UV_NO_CACHE=1 \
     MCP_SERVER_HOST="0.0.0.0" \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH="/workspace:${PYTHONPATH}"
 
 # Create non-root user
 RUN groupadd -r app && useradd -r -d /app -g app app
 
-# Copy project files for dependency installation (better caching)
-COPY pyproject.toml uv.lock ./
+# Create workspace structure matching local development
+WORKDIR /workspace
+RUN mkdir -p /workspace/mcp_server /workspace/graphiti_core
 
-# Install dependencies first (better layer caching)
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+# Set proper permissions for workspace
+RUN chown -R app:app /app /workspace
 
-# Copy application code
-COPY graphiti_mcp_server.py ./
+# Copy the entire graphiti_core source code first (for dependencies)
+COPY --chown=app:app ../graphiti_core /workspace/graphiti_core/
+COPY --chown=app:app ../pyproject.toml /workspace/
+COPY --chown=app:app ../poetry.lock /workspace/
+COPY --chown=app:app ../uv.lock /workspace/
 
-# Change ownership to app user
-RUN chown -Rv app:app /app
+# Copy MCP server files
+COPY --chown=app:app mcp_server/pyproject.toml /workspace/mcp_server/
+COPY --chown=app:app mcp_server/uv.lock /workspace/mcp_server/
+
+# Switch to MCP server directory
+WORKDIR /workspace/mcp_server
+
+# Install dependencies with local graphiti_core (disable all caching)
+ENV UV_NO_CACHE=true
+RUN rm -rf /tmp/uv-cache /root/.cache/uv /workspace/.cache 2>/dev/null || true
+RUN uv sync --frozen --no-dev
+
+# Copy MCP server application code
+COPY --chown=app:app mcp_server/graphiti_mcp_server.py ./
+COPY --chown=app:app mcp_server/.env* ./
+
+# Fix any remaining permissions and clean any cache
+RUN chown -R app:app /workspace && \
+    rm -rf /tmp/uv-cache /root/.cache /workspace/.cache 2>/dev/null || true
 
 # Switch to non-root user
 USER app

@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "graphiti-docker": {
+      "command": "curl",
+      "args": [
+        "-N",
+        "-H", "Accept: text/event-stream",
+        "-H", "Cache-Control: no-cache",
+        "http://localhost:8122/sse"
+      ],
+      "env": {
+        "MCP_TRANSPORT": "sse",
+        "MCP_URL": "http://localhost:8122"
+      }
+    }
+  }
+}

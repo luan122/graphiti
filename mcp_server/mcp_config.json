@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "graphiti-local": {
+      "command": "uv",
+      "args": ["run", "graphiti_mcp_server.py"],
+      "cwd": "G:\\Repos\\graphiti\\mcp_server"
+    },
+    "graphiti-docker": {
+      "command": "curl",
+      "args": [
+        "-N",
+        "-H", "Accept: text/event-stream",
+        "http://localhost:8122/sse"
+      ]
+    }
+  }
+}
